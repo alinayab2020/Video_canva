@@ -59,36 +59,116 @@ const codec = require(process.env.CODEC_JS);
 """
 
 COLLECT_JS = r"""
-/** Connect to the live server, decode `MAX` adaptive frames, dump them. */
+/** Connect to the live server, decode `MAX` adaptive frames, dump them.
+ *
+ * Raw RFC-6455 client over net/crypto only — CI runs Node 20, where the
+ * global WebSocket is still flag-gated, and no npm deps are installed.
+ * Handles the unmasked server->client frame grammar (16/64-bit lengths,
+ * TCP fragmentation) and answers pings; client frames are masked per spec.
+ */
 const fs = require('fs');
+const net = require('net');
+const crypto = require('crypto');
 const codec = require(process.env.CODEC_JS);
 // node -e shifts argv: the port is the first all-digit argv entry.
 const PORT = process.argv.find(a => /^\d+$/.test(a));
 const MAX = 120;
+
+function sendFrame(sock, op, payload) {
+  const len = payload.length;
+  const mask = crypto.randomBytes(4);
+  let head;
+  if (len < 126) {
+    head = Buffer.from([0x80 | op, 0x80 | len]);
+  } else if (len < 65536) {
+    head = Buffer.alloc(4);
+    head[0] = 0x80 | op; head[1] = 0x80 | 126; head.writeUInt16BE(len, 2);
+  } else {
+    head = Buffer.alloc(10);
+    head[0] = 0x80 | op; head[1] = 0x80 | 127;
+    head.writeBigUInt64BE(BigInt(len), 2);
+  }
+  const masked = Buffer.from(payload);
+  for (let i = 0; i < masked.length; i++) masked[i] ^= mask[i & 3];
+  sock.write(Buffer.concat([head, mask, masked]));
+}
+
+function wsConnect(port, path, onText, onBinary) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(port, '127.0.0.1', () => {
+      sock.write(
+        `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+        'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
+        `Sec-WebSocket-Key: ${crypto.randomBytes(16).toString('base64')}\r\n` +
+        'Sec-WebSocket-Version: 13\r\n\r\n');
+    });
+    let buf = Buffer.alloc(0);
+    let handshakeDone = false;
+    const fail = (e) => { try { sock.destroy(); } catch (_) {} reject(e); };
+    sock.on('error', fail);
+    sock.on('data', (d) => {
+      buf = Buffer.concat([buf, d]);
+      if (!handshakeDone) {
+        const idx = buf.indexOf('\r\n\r\n');
+        if (idx < 0) return;
+        const head = buf.slice(0, idx).toString();
+        if (!head.startsWith('HTTP/1.1 101')) {
+          return fail(new Error('handshake: ' + head.split('\r\n')[0]));
+        }
+        buf = buf.slice(idx + 4);
+        handshakeDone = true;
+        resolve({ close: () => sendFrame(sock, 0x8, Buffer.alloc(0)) });
+      }
+      while (true) {
+        if (buf.length < 2) return;
+        const fin = buf[0] & 0x80, op = buf[0] & 0x0f;
+        let len = buf[1] & 0x7f, off = 2;
+        if (len === 126) {
+          if (buf.length < 4) return;
+          len = buf.readUInt16BE(2); off = 4;
+        } else if (len === 127) {
+          if (buf.length < 10) return;
+          len = Number(buf.readBigUInt64BE(2)); off = 10;
+        }
+        if (buf.length < off + len) return;
+        const payload = buf.slice(off, off + len);
+        buf = buf.slice(off + len);
+        if (op === 0x9) { sendFrame(sock, 0xA, payload); continue; }  // ping
+        if (!fin || op === 0x8) return;      // no fragmentation expected
+        if (op === 0x1) onText(payload.toString());
+        else if (op === 0x2) onBinary(payload);
+      }
+    });
+  });
+}
+
 (async () => {
-  const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?codec=adaptive`);
-  ws.binaryType = 'arraybuffer';
   let rows = 0, cols = 0, decoder = null;
   const frames = [];
   await new Promise((resolve, reject) => {
-    const kill = setTimeout(() => reject(new Error('timeout collecting')), 60000);
-    ws.onmessage = async (ev) => {
-      if (typeof ev.data === 'string') {
-        if (ev.data.startsWith('INIT:')) {
-          const p = ev.data.split(':');
+    const kill = setTimeout(() => reject(new Error('timeout collecting')),
+                            60000);
+    let ws = null;
+    wsConnect(PORT, '/ws?codec=adaptive',
+      (t) => {
+        if (t.startsWith('INIT:')) {
+          const p = t.split(':');
           cols = parseInt(p[3]); rows = parseInt(p[4]);
           decoder = codec.makeDecoder(parseInt(p[5]) === 1 ? 3 : 4);
         }
-        return;
-      }
-      const { frameIndex, frame } = await decoder.decode(ev.data);
-      frames.push(Buffer.from(frame));
-      if (frames.length >= MAX) { clearTimeout(kill); ws.close(); resolve(); }
-    };
-    ws.onerror = (e) => { clearTimeout(kill); reject(e.error || new Error('ws error')); };
+      },
+      async (b) => {
+        const { frame } = await decoder.decode(b);
+        frames.push(Buffer.from(frame));
+        if (frames.length >= MAX) {
+          clearTimeout(kill); ws.close(); resolve();
+        }
+      })
+      .then((w) => { ws = w; }, reject);
   });
   fs.writeFileSync(process.env.OUT_BIN, Buffer.concat(frames));
   console.log(JSON.stringify({ n: frames.length, rows, cols }));
+  process.exit(0);
 })();
 """
 
