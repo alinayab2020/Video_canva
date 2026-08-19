@@ -11,12 +11,16 @@ Output dir layout (experiments/vectors/<name>/):
 import os, sys, json, struct
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ascii_video_player2 import VideoDecoder, AsciiMapper
+from ascii_video_player2 import VideoDecoder, AsciiMapper, MODE_QUANTIZE_BITS
 from codec import encode_frame
 
 def gen(path, name, mode, pixel, cols=200, rows=80, limit=90, tol=0):
-    mapper = AsciiMapper(); qb = {5:0,4:2,3:3,2:5}.get(mode,0)
+    # Same mapping the live server/compiler use: proportional gray->index LUT
+    # and the shared mode->quantization table (single source of truth).
+    mapper = AsciiMapper(); qb = MODE_QUANTIZE_BITS.get(mode,0)
     lut = np.array([ord(c) for c in mapper._lut], np.uint8)
+    idx_lut = mapper.index_lut()
+    qb_mask = np.uint8((0xFF << qb) & 0xFF) if qb else None
     dec = VideoDecoder(path, cols, rows, skip_gray=pixel)
     outdir = os.path.join("experiments/vectors", name); os.makedirs(outdir, exist_ok=True)
     fa = open(os.path.join(outdir,"adaptive.bin"),"wb")
@@ -26,10 +30,12 @@ def gen(path, name, mode, pixel, cols=200, rows=80, limit=90, tol=0):
         if pixel:
             frame = np.ascontiguousarray(bgr)               # (rows,cols,3) BGR
         else:
-            idx = np.floor_divide(gray, max(1,256//mapper._n)); np.clip(idx,0,mapper._n-1,out=idx)
-            rgb = bgr[:,:,::-1]
-            if qb: rgb = (rgb>>qb)<<qb
-            frame = np.empty((rows,cols,4),np.uint8); frame[:,:,0]=lut[idx]; frame[:,:,1:]=rgb
+            idx = idx_lut[gray]
+            frame = np.empty((rows,cols,4),np.uint8); frame[:,:,0]=lut[idx]
+            if qb_mask is not None:
+                np.bitwise_and(bgr[:,:,::-1], qb_mask, out=frame[:,:,1:])
+            else:
+                frame[:,:,1:] = bgr[:,:,::-1]
         msg, prev = encode_frame(frame, prev, n, tolerance=tol)
         # Truth = the encoder's intended frame (prev/shown), which for lossy is
         # the bounded approximation the client must reconstruct exactly.

@@ -52,7 +52,7 @@ from websockets.exceptions import ConnectionClosed
 from contextlib import asynccontextmanager
 
 # Import the existing engine (ascii_video_player2.py)
-from ascii_video_player2 import VideoDecoder, AsciiMapper
+from ascii_video_player2 import VideoDecoder, AsciiMapper, MODE_QUANTIZE_BITS
 from codec import encode_frame
 
 # ── FILTER PALETTES ──────────────────────────────────────────────────────────
@@ -665,6 +665,7 @@ async def websocket_endpoint(websocket: WebSocket):
             source_fps   = decoder.fps
             MAX_FPS      = 30
             char_byte_lut= np.array([ord(c) for c in mapper._lut], dtype=np.uint8)
+            gray_index_lut = mapper.index_lut()   # gray -> palette index LUT
 
             # ── RUNTIME FILTERS (contrast / gamma / brightness / invert / sharpness / palette) ──
             # These are mutated by the "filter" command from the client.
@@ -677,7 +678,10 @@ async def websocket_endpoint(websocket: WebSocket):
             sharpness_kernel  = None
             filter_palette    = "default"
             gray_lut          = None  # None = identity (skip cv2.LUT call)
-            qb           = {6: 0, 5: 2, 4: 3, 3: 5, 2: 6}.get(render_mode, 0)
+            qb           = MODE_QUANTIZE_BITS.get(render_mode, 0)
+            # `(x >> qb) << qb` == `x & qb_mask` for uint8 — but the mask form
+            # fuses reversal+quantization+store into ONE pass (no temp arrays).
+            qb_mask      = np.uint8((0xFF << qb) & 0xFF) if qb else None
 
             # ── FPS DECIMATION ──
             # If source > 30 FPS, skip every Nth frame using grab() (no decode).
@@ -761,9 +765,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     if gray_lut is not None:
                         gray_frame = cv2.LUT(gray_frame, gray_lut)
                     
-                    # Proportional mapping: evenly distribute 0-255 across 0 to (_n - 1)
-                    indices = (gray_frame.astype(np.uint16) * (mapper._n - 1)) // 255
-                    np.clip(indices, 0, mapper._n - 1, out=indices) # Defensive clip
+                    # Proportional mapping 0-255 -> palette index: one LUT
+                    # lookup per cell (multiply/divide/clip precomputed once).
+                    indices = gray_index_lut[gray_frame]
 
                     if render_mode == 1:
                         char_matrix = mapper._lut[indices]
@@ -772,16 +776,23 @@ async def websocket_endpoint(websocket: WebSocket):
                         sz = len(payload.encode('utf-8'))
                         return ('text', payload, pf, sz, sz)
                     else:
-                        char_codes = char_byte_lut[indices]
-                        rgb = bgr_frame[:, :, ::-1]
-                        if qb > 0:
-                            rgb = (rgb >> qb) << qb
-                        frame_buf[:, :, 0] = char_codes
-                        frame_buf[:, :, 1:] = rgb
+                        frame_buf[:, :, 0] = char_byte_lut[indices]
+                        # BGR -> RGB reversal + optional bit-drop quantization,
+                        # fused into a single pass that writes the frame buffer
+                        # directly (no intermediate allocations).
+                        if qb_mask is not None:
+                            np.bitwise_and(bgr_frame[:, :, ::-1], qb_mask,
+                                           out=frame_buf[:, :, 1:])
+                        else:
+                            frame_buf[:, :, 1:] = bgr_frame[:, :, ::-1]
                         raw_sz = 4 + rows * cols * 4
                         if adaptive:
+                            # encode_frame copies `frame` into its own state
+                            # whenever it retains a reference (full-frame and
+                            # delta paths), so passing the reusable frame_buf
+                            # directly is alias-safe — one less copy per frame.
                             msg, npf = encode_frame(
-                                frame_buf.copy(), pf, fi, 3, tolerance)
+                                frame_buf, pf, fi, 3, tolerance)
                             return ('bytes', msg, npf, raw_sz, len(msg))
                         else:
                             struct.pack_into(">I", ascii_send_buf, 0, fi)
@@ -917,6 +928,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 mapper = AsciiMapper(palette=FILTER_PALETTES[filter_palette])
                                 char_byte_lut = np.array(
                                     [ord(c) for c in mapper._lut], dtype=np.uint8)
+                                gray_index_lut = mapper.index_lut()
                                 prev_frame = None  # force keyframe after palette change
 
                             # Rebuild gray LUT when any scalar filter changes

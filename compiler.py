@@ -7,7 +7,7 @@ import numpy as np
 import sys
 
 # Import the existing engine components (now in the same directory)
-from ascii_video_player2 import VideoDecoder, AsciiMapper
+from ascii_video_player2 import VideoDecoder, AsciiMapper, MODE_QUANTIZE_BITS
 from codec import encode_frame, DEFAULT_LEVEL, ProfileEncoder
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
 
@@ -119,7 +119,10 @@ def compile_video(args):
         print(f"[Compiler] Lossy DCT profile (tag 4) ON | QF={args.qf} | grid padded to {cols}x{rows}")
 
     char_byte_lut = np.array([ord(c) for c in mapper._lut], dtype=np.uint8)
-    qb = {6: 0, 5: 2, 4: 3, 3: 5, 2: 6}.get(render_mode, 0)
+    # Same proportional gray->index mapping the live server uses, via LUT.
+    gray_index_lut = mapper.index_lut()
+    qb = MODE_QUANTIZE_BITS.get(render_mode, 0)
+    qb_mask = np.uint8((0xFF << qb) & 0xFF) if qb else None
     
     frame_buf = np.empty((rows, cols, 4), dtype=np.uint8) if render_mode > 1 else None
 
@@ -153,7 +156,8 @@ def compile_video(args):
                 if pixel_mode:
                     frame_px = np.ascontiguousarray(bgr_frame)
                     if pixel_qb > 0:
-                        frame_px = (frame_px >> pixel_qb) << pixel_qb
+                        # in-place bit-drop mask == (x >> qb) << qb, one pass
+                        frame_px &= np.uint8((0xFF << pixel_qb) & 0xFF)
                     if profile_enc is not None:
                         msg, prev_frame = profile_enc.encode(frame_px)
                     else:
@@ -162,22 +166,22 @@ def compile_video(args):
                             prev_frame, frame_index, level=level, tolerance=tolerance
                         )
                 else:
-                    indices = np.floor_divide(gray_frame, max(1, 256 // mapper._n))
-                    np.clip(indices, 0, mapper._n - 1, out=indices)
-                    
+                    # LUT lookup — identical mapping to the live server path.
+                    indices = gray_index_lut[gray_frame]
+
                     if render_mode == 1:
                         char_matrix = mapper._lut[indices]
                         lines = [''.join(r) for r in char_matrix]
                         payload = (f"{frame_index}\n" + '\n'.join(lines)).encode('utf-8')
                         msg = payload # For mode 1, we just pack the string as bytes
                     else:
-                        char_codes = char_byte_lut[indices]
-                        rgb = bgr_frame[:, :, ::-1]
-                        if qb > 0:
-                            rgb = (rgb >> qb) << qb
-                        frame_buf[:, :, 0] = char_codes
-                        frame_buf[:, :, 1:] = rgb
-                        
+                        frame_buf[:, :, 0] = char_byte_lut[indices]
+                        if qb_mask is not None:
+                            np.bitwise_and(bgr_frame[:, :, ::-1], qb_mask,
+                                           out=frame_buf[:, :, 1:])
+                        else:
+                            frame_buf[:, :, 1:] = bgr_frame[:, :, ::-1]
+
                         msg, prev_frame = encode_frame(
                             frame_buf, prev_frame, frame_index, level=level, tolerance=tolerance
                         )
