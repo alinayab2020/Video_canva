@@ -5,11 +5,17 @@ Covers the whole defensive surface added to stream_server.py:
   * HTTP security headers (CSP, anti-sniff, clickjacking, referrer, CORP/COOP)
     and cache policy (no-store on session endpoints, bounded static caching)
   * static-file whitelist (no path escape, no source disclosure)
+  * /audio pool saturation -> 503, muted -> 204, offset sanitization
   * WebSocket resilience: malformed frames, non-dict JSON, NaN/inf/junk
     command payloads must never kill the stream or the command pump
   * WebSocket admission control (max-client cap -> close 1013)
-  * /audio process-pool saturation -> 503 instead of fork-bombing
   * pure coercion/sanitization helpers
+
+Most tests call the ASGI building blocks directly (like the scrub tests do),
+so they run in the minimal CI dependency set. Tests that need a full HTTP/WS
+round trip use FastAPI's TestClient, which requires `httpx`; those skip
+cleanly when it is not installed (e.g. the stock CI image) and run fully
+otherwise (`pip install -e ".[test]"`).
 
     pytest test/test_security.py
 """
@@ -19,6 +25,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import asyncio
 
 import numpy as np
 import cv2
@@ -39,6 +46,37 @@ def _make_video(path, frames=24, w=64, h=48, fps=12.0):
         vw.write(img)
     vw.release()
     return os.path.exists(path) and os.path.getsize(path) > 0
+
+
+def _has_testclient():
+    try:
+        from fastapi.testclient import TestClient  # noqa: F401
+        return True
+    except Exception:
+        return False  # httpx not installed (minimal CI dependency set)
+
+
+class _FakeURL:
+    def __init__(self, path):
+        self.path = path
+
+
+class _FakeRequest:
+    """Just enough Request for security_headers() (it only reads .url.path)."""
+    def __init__(self, path):
+        self.url = _FakeURL(path)
+
+
+def _apply_security_headers(path, media_type="text/plain"):
+    """Run the real middleware against a fake request and return its headers."""
+    from fastapi import Response
+
+    async def call_next(request):
+        return Response(content=b"x", media_type=media_type)
+
+    response = asyncio.run(ss.security_headers(_FakeRequest(path), call_next))
+    # Starlette normalizes to a lowercase-case-insensitive store; read via dict
+    return {k.lower(): v for k, v in response.headers.items()}
 
 
 # ── pure helpers ─────────────────────────────────────────────────────────
@@ -69,75 +107,109 @@ class CoercionTests(unittest.TestCase):
         self.assertEqual(_clamp_seek_time(42.0, 0.0), 42.0)
 
 
-# ── HTTP surface ─────────────────────────────────────────────────────────
-class HttpSecurityTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        from fastapi.testclient import TestClient
-        cls.tmp = tempfile.mkdtemp(prefix="asciline_sec_")
-        cls.video = os.path.join(cls.tmp, "clip.avi")
-        if not _make_video(cls.video):
-            raise unittest.SkipTest("OpenCV could not write a test video here.")
-        ss.app.state.queue = [{
-            "video": cls.video, "mode": 5, "pixel": False, "vol": 1, "rows": 0,
-        }]
-        ss.app.state.current_index = 0
-        cls.client_ctx = TestClient(ss.app)
-        cls.client = cls.client_ctx.__enter__()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.client_ctx.__exit__(None, None, None)
-        shutil.rmtree(cls.tmp, ignore_errors=True)
-
-    def test_security_headers_on_root(self):
-        r = self.client.get("/")
-        self.assertEqual(r.status_code, 200)
-        h = r.headers
+# ── middleware-level HTTP surface (no transport needed) ─────────────────
+class HeaderSecurityTests(unittest.TestCase):
+    def _common_headers_assertions(self, h):
         self.assertEqual(h.get("x-content-type-options"), "nosniff")
         self.assertEqual(h.get("x-frame-options"), "DENY")
         self.assertEqual(h.get("referrer-policy"), "no-referrer")
         self.assertIn("camera=()", h.get("permissions-policy", ""))
         self.assertEqual(h.get("cross-origin-opener-policy"), "same-origin")
+        self.assertEqual(h.get("cross-origin-resource-policy"), "same-origin")
+
+    def test_root_gets_full_policy_set(self):
+        h = _apply_security_headers("/")
+        self._common_headers_assertions(h)
         csp = h.get("content-security-policy", "")
         self.assertIn("default-src 'self'", csp)
         self.assertIn("object-src 'none'", csp)
         self.assertIn("frame-ancestors 'none'", csp)
+        self.assertIn("base-uri 'none'", csp)
         # session content must never be shared-cached
         self.assertEqual(h.get("cache-control"), "no-store")
 
-    def test_static_whitelist_and_cache(self):
-        r = self.client.get("/static/app.js")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.headers.get("cache-control"), "public, max-age=300")
-        self.assertEqual(r.headers.get("x-content-type-options"), "nosniff")
-        # source files are not on the whitelist
-        for blocked in ("stream_server.py", "codec.py", "logo.py", ".git"):
-            self.assertEqual(self.client.get(f"/static/{blocked}").status_code, 404)
-        # traversal attempts cannot escape the whitelist either
-        for evil in ("..%2Fstream_server.py", "..%5Cstream_server.py", "%2E%2E%2Fcodec.py"):
-            self.assertNotEqual(self.client.get(f"/static/{evil}").status_code, 200)
+    def test_csp_not_leaked_to_api_paths(self):
+        h = _apply_security_headers("/audio")
+        self.assertNotIn("content-security-policy", h)
+        self.assertEqual(h.get("cache-control"), "no-store")
+
+    def test_session_paths_are_no_store(self):
+        for path in ("/", "/audio", "/scrub", "/scrub_sprite", "/healthz"):
+            h = _apply_security_headers(path)
+            self.assertEqual(h.get("cache-control"), "no-store", path)
+
+    def test_static_assets_get_bounded_cache(self):
+        h = _apply_security_headers("/static/app.js")
+        self.assertEqual(h.get("cache-control"), "public, max-age=300")
+        self.assertEqual(h.get("x-content-type-options"), "nosniff")
+
+    def test_middleware_never_clobbers_existing_headers(self):
+        from fastapi import Response
+
+        async def call_next(request):
+            r = Response(content=b"x", media_type="text/plain")
+            r.headers["Cache-Control"] = "custom-policy"
+            return r
+
+        response = asyncio.run(
+            ss.security_headers(_FakeRequest("/audio"), call_next))
+        self.assertEqual(response.headers["Cache-Control"], "custom-policy")
+        # but the baseline hardening still lands
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+
+    def test_healthz_payload(self):
+        body = asyncio.run(ss.healthz())
+        self.assertEqual(body, {"status": "ok"})
+
+
+# ── static whitelist + /audio endpoint semantics (direct calls) ─────────
+class EndpointSecurityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="asciline_sec_")
+        cls.video = os.path.join(cls.tmp, "clip.avi")
+        if not _make_video(cls.video):
+            raise unittest.SkipTest("OpenCV could not write a test video here.")
+        cls.saved_queue = getattr(ss.app.state, "queue", None)
+        ss.app.state.queue = [{
+            "video": cls.video, "mode": 5, "pixel": False, "vol": 1, "rows": 0,
+        }]
+        ss.app.state.current_index = 0
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.saved_queue is not None:
+            ss.app.state.queue = cls.saved_queue
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_static_whitelist_blocks_sources(self):
+        from fastapi import HTTPException
+        # whitelisted assets serve fine
+        resp = asyncio.run(ss.serve_static("app.js"))
+        self.assertTrue(getattr(resp, "status_code", 200) == 200)
+        # anything not whitelisted — sources, dotfiles, traversal — is a 404
+        for blocked in ("stream_server.py", "codec.py", "logo.py", ".git",
+                        "..%2Fstream_server.py", "..%5Cstream_server.py",
+                        "%2E%2E%2Fcodec.py", "../stream_server.py"):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(ss.serve_static(blocked))
+            self.assertEqual(ctx.exception.status_code, 404, blocked)
 
     def test_audio_pool_saturation_returns_503(self):
-        import asyncio
+        from fastapi import HTTPException
         saved = getattr(ss.app.state, "audio_semaphore", None)
         try:
             gate = asyncio.Semaphore(1)
-            # simulate an active stream occupying the only slot
-            async def lock_it():
+
+            async def hold():
                 await gate.acquire()
-            asyncio.get_event_loop_policy().new_event_loop().run_until_complete(lock_it())
+            asyncio.run(hold())  # occupy the only slot
             ss.app.state.audio_semaphore = gate
-            r = self.client.get("/audio")
-            self.assertEqual(r.status_code, 503)
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(ss.audio_stream(v=None, start=0.0))
+            self.assertEqual(ctx.exception.status_code, 503)
         finally:
             ss.app.state.audio_semaphore = saved
-
-    def test_healthz(self):
-        r = self.client.get("/healthz")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json(), {"status": "ok"})
-        self.assertEqual(r.headers.get("cache-control"), "no-store")
 
     def test_audio_muted_video_is_204(self):
         saved = ss.app.state.queue
@@ -145,21 +217,21 @@ class HttpSecurityTests(unittest.TestCase):
             ss.app.state.queue = [{
                 "video": self.video, "mode": 5, "pixel": False, "vol": 0, "rows": 0,
             }]
-            self.assertEqual(self.client.get("/audio").status_code, 204)
+            resp = asyncio.run(ss.audio_stream(v=None, start=0.0))
+            self.assertEqual(resp.status_code, 204)
         finally:
             ss.app.state.queue = saved
 
     def test_audio_start_param_is_sanitized(self):
-        if not shutil.which("ffmpeg"):
-            self.skipTest("ffmpeg not installed")
-        # negative / garbage offsets must not reach the ffmpeg cmdline — the
-        # endpoint still serves (or cleanly 200s), never a 500.
-        for bad in ("-50", "0"):
-            r = self.client.get(f"/audio?start={bad}")
-            self.assertEqual(r.status_code, 200)
+        # negative / zero offsets must not reach the ffmpeg cmdline: the
+        # endpoint answers with a normal streaming response, never raises.
+        for bad in (-50.0, 0.0):
+            resp = asyncio.run(ss.audio_stream(v=None, start=bad))
+            self.assertEqual(getattr(resp, "status_code", 200), 200)
 
 
-# ── WebSocket resilience ─────────────────────────────────────────────────
+# ── WebSocket resilience (transport-level; needs httpx via TestClient) ───
+@unittest.skipUnless(_has_testclient(), "fastapi TestClient (httpx) not installed")
 class WebSocketSecurityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -183,7 +255,6 @@ class WebSocketSecurityTests(unittest.TestCase):
 
     def test_malformed_commands_do_not_kill_stream(self):
         from fastapi.testclient import TestClient
-        from starlette.websockets import WebSocketDisconnect
         self._queue()
         with TestClient(ss.app) as client:
             with client.websocket_connect("/ws?codec=adaptive") as ws:
