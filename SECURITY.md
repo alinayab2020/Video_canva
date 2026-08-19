@@ -40,6 +40,27 @@ authentication (e.g. nginx + Basic Auth, Caddy, or an identity-aware proxy),
 and connect the browser via `https://`/`wss://` — the frontend negotiates
 `wss:` automatically from the page scheme.
 
+## Forensic Watermark Key Handling
+
+The optional `--watermark` feature marks streams with a keyed,
+screen-capture-proof 10-digit ID for leak tracing. Its security reduces
+to the secrecy of the watermark key:
+
+- Pass it via the `ASCILINE_WM_KEY` environment variable (the
+  `--watermark-key` CLI argument is visible in process listings); the
+  server logs only a 10-hex-digit SHA-256 fingerprint of the key, never
+  the key itself.
+- Use a long random key (≥128 bits). The mark's detectability and its
+  resistance to reading/removal by third parties are both functions of
+  key entropy: detection without the key is empirically null
+  (z ≈ 0–3σ, CRC-16 false-accept ≤ 2⁻¹⁶ per hypothesis), and each key is
+  an independent marking universe.
+- Rotate keys on staff/system compromise like any other HMAC secret; IDs
+  embedded under an old key remain verifiable with that old key.
+
+The full scheme, threat model and measured attack matrix live in
+[docs/WATERMARK.md](docs/WATERMARK.md).
+
 ## Reporting a Vulnerability
 
 Please report vulnerabilities privately to

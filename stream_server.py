@@ -54,6 +54,7 @@ from contextlib import asynccontextmanager
 # Import the existing engine (ascii_video_player2.py)
 from ascii_video_player2 import VideoDecoder, AsciiMapper, MODE_QUANTIZE_BITS
 from codec import encode_frame
+from watermark import Watermarker
 
 # ── FILTER PALETTES ──────────────────────────────────────────────────────────
 # Named character palettes that the client can switch between at runtime.
@@ -833,6 +834,27 @@ async def _stream_to_client(websocket: WebSocket):
             char_byte_lut= np.array([ord(c) for c in mapper._lut], dtype=np.uint8)
             gray_index_lut = mapper.index_lut()   # gray -> palette index LUT
 
+            # ── FORENSIC WATERMARK ─────────────────────────────────────
+            # Invisible, keyed, screen-capture-proof 10-digit mark (see
+            # watermark.py / docs/WATERMARK.md). Built per grid geometry.
+            wm_cfg = getattr(app.state, "watermark", None)
+
+            def _build_watermarker(c, r):
+                if not wm_cfg:
+                    return None
+                digits, key, wblock, wbeta = wm_cfg
+                try:
+                    return Watermarker(digits, key, r, c,
+                                       block=wblock, beta=wbeta)
+                except ValueError as e:
+                    print(f"[WATERMARK] disabled for {c}x{r} grid: {e}")
+                    return None
+
+            watermarker = _build_watermarker(cols, rows)
+            # Alternation clock: counts SENT frames only, so server-side
+            # backpressure drops never desync the ± sign pattern.
+            wm_tick = 0
+
             # ── RUNTIME FILTERS (contrast / gamma / brightness / invert / sharpness / palette) ──
             # These are mutated by the "filter" command from the client.
             # gray_lut is a cached 256-byte LUT rebuilt only on value change.
@@ -940,6 +962,10 @@ async def _stream_to_client(websocket: WebSocket):
                     return None
 
                 if pixel_mode:
+                    # Forensic mark: ±beta luminance dither on the cell
+                    # colours (saturation = erasure-only, never inversion).
+                    if watermarker is not None:
+                        watermarker.embed_pixels(bgr_frame, wm_tick, gray=None)
                     raw_sz = 4 + rows * cols * 3
                     struct.pack_into(">I", pixel_send_buf, 0, fi)
                     pixel_send_buf[4:] = bgr_frame.tobytes()
@@ -960,6 +986,11 @@ async def _stream_to_client(websocket: WebSocket):
                     indices = gray_index_lut[gray_frame]
 
                     if render_mode == 1:
+                        # Forensic mark (monochrome text): ±1 glyph density-
+                        # rank dither — the only carrier without colours.
+                        if watermarker is not None:
+                            watermarker.embed_indices(
+                                indices, wm_tick, mapper._n, gray_frame)
                         char_matrix = mapper._lut[indices]
                         lines = [''.join(row) for row in char_matrix]
                         payload = f"{fi}\n" + '\n'.join(lines)
@@ -975,6 +1006,12 @@ async def _stream_to_client(websocket: WebSocket):
                                            out=frame_buf[:, :, 1:])
                         else:
                             frame_buf[:, :, 1:] = bgr_frame[:, :, ::-1]
+                        # Forensic mark: ±beta luminance dither on the cell
+                        # COLOUR (glyphs untouched → structurally invisible,
+                        # and font-agnostic polarity at detection).
+                        if watermarker is not None:
+                            watermarker.embed_pixels(
+                                frame_buf[:, :, 1:], wm_tick, gray_frame)
                         raw_sz = 4 + rows * cols * 4
                         if adaptive:
                             # encode_frame copies `frame` into its own state
@@ -1072,6 +1109,7 @@ async def _stream_to_client(websocket: WebSocket):
                                 frame_buf = np.empty((rows, cols, 4), dtype=np.uint8)
                             if pixel_mode:
                                 pixel_send_buf = bytearray(4 + rows * cols * 3)
+                            watermarker = _build_watermarker(cols, rows)
                             
                             duration = decoder.frame_count / decoder.fps if decoder.fps > 0 else 0
                             target_sec = _clamp_seek_time(msg.get("time", 0), duration)
@@ -1217,6 +1255,7 @@ async def _stream_to_client(websocket: WebSocket):
                     if wait > 0 and not is_webcam:
                         await asyncio.sleep(wait)
 
+                    wm_tick += 1   # sent-frame alternation clock (watermark)
                     frame_index += 1
 
             finally:
@@ -1279,6 +1318,10 @@ HELP_TEXT = "\033[1;37m" + """
 ║  \033[32m--port\033[1;37m  \033[35mN\033[1;37m      Server port    (default: 8000)    ║
 ║  \033[32m--max-clients\033[1;37m \033[35mN\033[1;37m Simultaneous stream cap (def. 32)║
 ║  \033[32m--debug\033[1;37m        Show bandwidth stats (RAW/WIRE)  ║
+║                                                   ║
+║  \\033[33m─── Forensics ───\\033[1;37m                              ║
+║  \\033[32m--watermark\\033[1;37m \\033[35mID\\033[1;37m  Burn invisible 10-digit mark    ║
+║  \\033[32m--watermark-key\\033[1;37m \\033[35mK\\033[1;37m  Secret (or env WM_KEY)      ║
 ║                                                   ║
 ╚═══════════════════════════════════════════════════╝
 """ + "\033[0m"
@@ -1432,6 +1475,32 @@ if __name__ == "__main__":
              "of the video; the cap blocks connection-flood resource exhaustion)"
     )
 
+    # ── Forensic watermark ──
+    forensics = parser.add_argument_group('\033[33mForensic Watermark\033[0m')
+    forensics.add_argument(
+        "--watermark",
+        metavar="10-DIGITS",
+        default=None,
+        help="Invisibly burn this 10-digit ID into every rendered frame "
+             "(screen-capture-proof forensic mark; modes 1-6 and --pixel)"
+    )
+    forensics.add_argument(
+        "--watermark-key",
+        default=None,
+        help="Secret key for the mark (or set env ASCILINE_WM_KEY). "
+             "Required with --watermark; keep it out of process listings."
+    )
+    forensics.add_argument(
+        "--watermark-block", type=int, default=1, metavar="N",
+        help="Frames per alternation clock (default 1 = max robustness; "
+             "use 2 when 15 fps screen captures are expected)"
+    )
+    forensics.add_argument(
+        "--watermark-beta", type=int, default=8, metavar="1-64",
+        help="Luma dither amplitude of the cell-colour carrier (default 8; "
+             "monochrome -m 1 dithers glyph density ranks instead)"
+    )
+
     args = parser.parse_args()
 
     # Automatically switch to a color mode if pixel mode is requested,
@@ -1464,6 +1533,27 @@ if __name__ == "__main__":
     global_default_cols     = args.cols if args.cols is not None else (450 if args.pixel else 200)
     app.state.cols          = global_default_cols
     app.state.rows          = args.rows
+
+    # ── Forensic watermark: validate & configure (never log the key) ──
+    if args.watermark is not None:
+        from watermark import encode_payload as _wm_encode_payload
+        try:
+            _wm_encode_payload(args.watermark)
+        except ValueError as e:
+            parser.error(f"--watermark: {e}")
+        wm_key = args.watermark_key or os.environ.get("ASCILINE_WM_KEY")
+        if not wm_key:
+            parser.error("--watermark requires --watermark-key or env ASCILINE_WM_KEY")
+        import hashlib as _hashlib
+        wm_fp = _hashlib.sha256(wm_key.encode()).hexdigest()[:10]
+        app.state.watermark = (args.watermark, wm_key,
+                               max(1, args.watermark_block),
+                               max(1, min(64, args.watermark_beta)))
+        print(f" \033[1;35m[FORENSIC]\033[0m 10-digit watermark embedded "
+              f"(id='{args.watermark}', key sha256:{wm_fp}…, "
+              f"block={max(1, args.watermark_block)})")
+    else:
+        app.state.watermark = None
 
     # ── High FPS Warning ──
     high_fps_videos = []
