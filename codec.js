@@ -214,5 +214,63 @@
     return { decode, reset() { prev = null; profileDec = null; } };
   }
 
-  return { makeDecoder, makeProfileDecoder, inflate, TAG_RAW, TAG_ZLIB, TAG_DELTA, TAG_RLE_FULL, TAG_PROFILE };
+  // ===== Canvas render helpers (shared by the live player and the static
+  // players; pure functions with no DOM dependency so the Node test suite can
+  // pin their exact byte behavior). =====
+
+  // Endianness probe (once at module load). Every mainstream engine is
+  // little-endian, but the code stays correct on theoretical big-endian hosts.
+  const _LITTLE_ENDIAN = (() => {
+    const b = new ArrayBuffer(4);
+    new Uint32Array(b)[0] = 0x0A0B0C0D;
+    return new Uint8Array(b)[0] === 0x0D;
+  })();
+
+  /**
+   * Pack an interleaved BGR byte stream into a canvas-ready RGBA32 buffer.
+   * Little-endian hosts emit one 32-bit store per pixel (R|G<<8|B<<16|A<<24
+   * lands in memory as bytes R,G,B,A) instead of three 8-bit stores; other
+   * hosts take the byte path with identical visual output.
+   * @param {Uint8Array} bgr  BGR triplets, length = pixels*3
+   * @param {Uint32Array} out32  RGBA32 view over an ImageData buffer
+   */
+  function packBGRtoRGBA32(bgr, out32) {
+    const n = Math.min((bgr.length / 3) | 0, out32.length);
+    if (_LITTLE_ENDIAN) {
+      for (let s = 0, p = 0; p < n; p++, s += 3) {
+        out32[p] = 0xFF000000 | (bgr[s] << 16) | (bgr[s + 1] << 8) | bgr[s + 2];
+      }
+    } else {
+      const out8 = new Uint8Array(out32.buffer, out32.byteOffset);
+      for (let s = 0, d = 0, p = 0; p < n; p++, s += 3, d += 4) {
+        out8[d]     = bgr[s + 2]; // R
+        out8[d + 1] = bgr[s + 1]; // G
+        out8[d + 2] = bgr[s];     // B
+        out8[d + 3] = 255;        // A
+      }
+    }
+  }
+
+  /**
+   * Bounded memoizer for canvas fillStyle color strings. Frames re-use a few
+   * thousand distinct packed colors, so caching the "rgb(r,g,b)" string turns
+   * every later color switch into a map hit instead of an allocation. Bounded
+   * growth: once `limit` entries exist the cache stops absorbing new colors
+   * (hot set stays cached; pathological gradients just bypass).
+   */
+  function makeColorCache(limit = 8192) {
+    const map = new Map();
+    return function cssRGB(r, g, b) {
+      const key = (r << 16) | (g << 8) | b;
+      let s = map.get(key);
+      if (s === undefined) {
+        s = 'rgb(' + r + ',' + g + ',' + b + ')';
+        if (map.size < limit) map.set(key, s);
+      }
+      return s;
+    };
+  }
+
+  return { makeDecoder, makeProfileDecoder, inflate, packBGRtoRGBA32, makeColorCache,
+           TAG_RAW, TAG_ZLIB, TAG_DELTA, TAG_RLE_FULL, TAG_PROFILE };
 });

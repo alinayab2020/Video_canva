@@ -1,31 +1,71 @@
+/**
+ * Chunked byte-stream accumulator.
+ *
+ * The old design kept one contiguous buffer and re-copied it on EVERY push()
+ * and unshift() — O(total²) time for a stream delivered in N chunks (a 100 MB
+ * .ascf in 64 KiB fetch chunks re-copied ~800 GB). This version stores the
+ * chunks in a list and copies only the exact bytes a read() asks for:
+ * amortized O(1) push, O(bytes read) total copy work, no pathological cases.
+ *
+ * Semantics are unchanged: read(n) returns exactly n bytes or null; unshift()
+ * returns bytes to the front; `length` is the buffered byte count.
+ */
 class ByteStreamParser {
     constructor() {
-        this.buffer = new Uint8Array(0);
-    }
-    
-    push(chunk) {
-        const newBuf = new Uint8Array(this.buffer.length + chunk.length);
-        newBuf.set(this.buffer, 0);
-        newBuf.set(chunk, this.buffer.length);
-        this.buffer = newBuf;
+        this._chunks = [];
+        this._length = 0;
     }
 
+    push(chunk) {
+        if (chunk && chunk.length) {
+            this._chunks.push(chunk);
+            this._length += chunk.length;
+        }
+    }
+
+    // Consume exactly `bytes` from the front, or return null when short.
     read(bytes) {
-        if (this.buffer.length < bytes) return null;
-        const data = this.buffer.subarray(0, bytes);
-        this.buffer = this.buffer.subarray(bytes);
-        return data;
+        if (this._length < bytes) return null;
+        const out = new Uint8Array(bytes);
+        let off = 0, need = bytes;
+        while (need > 0) {
+            const head = this._chunks[0];
+            const take = Math.min(need, head.length);
+            out.set(head.subarray(0, take), off);
+            if (take === head.length) this._chunks.shift();
+            else this._chunks[0] = head.subarray(take);
+            off += take;
+            need -= take;
+        }
+        this._length -= bytes;
+        return out;
+    }
+
+    // Peek at the next `bytes` without consuming them (replaces peeking at the
+    // old .buffer field, which no longer exists).
+    peek(bytes) {
+        if (this._length < bytes) return null;
+        const out = new Uint8Array(bytes);
+        let off = 0, need = bytes, i = 0;
+        while (need > 0) {
+            const chunk = this._chunks[i++];
+            const take = Math.min(need, chunk.length);
+            out.set(chunk.subarray(0, take), off);
+            off += take;
+            need -= take;
+        }
+        return out;
     }
 
     // Push bytes back to the front of the buffer (for header rollback)
     unshift(chunk) {
-        const newBuf = new Uint8Array(chunk.length + this.buffer.length);
-        newBuf.set(chunk, 0);
-        newBuf.set(this.buffer, chunk.length);
-        this.buffer = newBuf;
+        if (chunk && chunk.length) {
+            this._chunks.unshift(chunk);  // O(#chunks) pointer move, ~free
+            this._length += chunk.length;
+        }
     }
-    
-    get length() { return this.buffer.length; }
+
+    get length() { return this._length; }
 }
 
 const textDecoder = new TextDecoder();
@@ -71,7 +111,12 @@ class AscilinePlayer {
         this.xPos = null;
         this.yPos = null;
         this.dotImageData = null;
+        this.dotImageData32 = null;
         this.selectionBuffer = null;
+        // Canvas color-string cache (shared helper; see codec.js)
+        this._cssRGB = (typeof AscilineCodec !== 'undefined' && AscilineCodec.makeColorCache)
+            ? AscilineCodec.makeColorCache()
+            : (r, g, b) => `rgb(${r},${g},${b})`;
 
         this.lastRenderTime = 0;
         this.frameCount = 0;
@@ -150,6 +195,7 @@ class AscilinePlayer {
             this.canvas.style.display = 'block';
             this.canvas.style.imageRendering = 'pixelated';
             this.dotImageData = this.ctx.createImageData(cols, rows);
+            this.dotImageData32 = new Uint32Array(this.dotImageData.data.buffer);
             const d = this.dotImageData.data;
             for (let i = 3; i < d.length; i += 4) d[i] = 255;
             syncSize(this.canvas);
@@ -157,6 +203,7 @@ class AscilinePlayer {
         } else {
             this.canvas.style.imageRendering = '';
             this.dotImageData = null;
+            this.dotImageData32 = null;
             this.charWidth = charWForLayout;
             this.charHeight = charHForLayout;
             this.canvas.width  = cols * this.charWidth;
@@ -296,9 +343,10 @@ class AscilinePlayer {
                 
                 if (headerParsed) {
                     while (parser.length >= 4) {
-                        const view = new DataView(parser.buffer.buffer, parser.buffer.byteOffset, 4);
+                        const head = parser.peek(4);
+                        const view = new DataView(head.buffer, head.byteOffset, 4);
                         const frameLen = view.getUint32(0, false);
-                        
+
                         if (parser.length >= 4 + frameLen) {
                             parser.read(4);
                             const frameBytes = parser.read(frameLen);
@@ -415,12 +463,17 @@ class AscilinePlayer {
             this.player.style.color = 'currentColor';
             this.player.textContent = frame;
         } else if (this.pixelMode) {
-            const view = frame;
-            const data = this.dotImageData.data;
-            for (let src = 0, dst = 0; src < view.length; src += 3, dst += 4) {
-                data[dst]     = view[src + 2];
-                data[dst + 1] = view[src + 1];
-                data[dst + 2] = view[src];
+            // One 32-bit store per pixel via the shared packer (see codec.js)
+            if (typeof AscilineCodec !== 'undefined' && AscilineCodec.packBGRtoRGBA32) {
+                AscilineCodec.packBGRtoRGBA32(frame, this.dotImageData32);
+            } else {
+                const view = frame;
+                const data = this.dotImageData.data;
+                for (let src = 0, dst = 0; src < view.length; src += 3, dst += 4) {
+                    data[dst]     = view[src + 2];
+                    data[dst + 1] = view[src + 1];
+                    data[dst + 2] = view[src];
+                }
             }
             this.ctx.putImageData(this.dotImageData, 0, 0);
         } else {
@@ -434,7 +487,7 @@ class AscilinePlayer {
             for (let idx = 0; idx < view.length; idx += 4) {
                 const packed = (view[idx+1] << 16) | (view[idx+2] << 8) | view[idx+3];
                 if (packed !== prevPacked) {
-                    this.ctx.fillStyle = `rgb(${view[idx+1]},${view[idx+2]},${view[idx+3]})`;
+                    this.ctx.fillStyle = this._cssRGB(view[idx+1], view[idx+2], view[idx+3]);
                     prevPacked = packed;
                 }
                 this.ctx.fillText(CHAR_LUT[view[idx]], this.xPos[col], this.yPos[row]);
@@ -545,14 +598,23 @@ class AscilinePlayer {
     }
 }
 
-// Global Spacebar Pause for all instances
-document.addEventListener('keydown', (e) => {
-    if (e.code === 'Space') {
-        e.preventDefault();
-        AscilinePlayer.instances.forEach(player => {
-            if (player.state === 'PLAYING' || player.state === 'PAUSED') {
-                player.togglePause();
-            }
-        });
-    }
-});
+// Global Spacebar Pause for all instances (browser only; guard keeps the
+// module importable by the Node test harness)
+if (typeof document !== 'undefined') {
+    document.addEventListener('keydown', (e) => {
+        if (e.code === 'Space') {
+            e.preventDefault();
+            AscilinePlayer.instances.forEach(player => {
+                if (player.state === 'PLAYING' || player.state === 'PAUSED') {
+                    player.togglePause();
+                }
+            });
+        }
+    });
+}
+
+// Node test harness hook (no effect in browsers). Placed last so every class
+// binding is initialized by the time a require() evaluates this.
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { ByteStreamParser, AscilinePlayer };
+}
