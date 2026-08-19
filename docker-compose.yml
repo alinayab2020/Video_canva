@@ -5,9 +5,24 @@ services:
       - "8000:8000"
     volumes:
       # Put local .mp4/.mkv/… files here; they appear inside the container as /app/videos
+      # The container runs as the non-root `asciline` user: for YouTube/URL
+      # downloads to be cacheable inside the container, make sure this folder
+      # is writable by that user (e.g. `mkdir -p videos && chmod 0777 videos`,
+      # or chown it to the container UID). Read-only playback needs nothing.
       - ./videos:/app/videos
     environment:
       - PYTHONUNBUFFERED=1
+    # Container hardening: the app needs no Linux capabilities (it binds the
+    # high port 8000) and must never gain new privileges via setuid binaries.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Optional stronger isolation (uncomment if every runtime write target is
+    # the mounted videos/ volume): 
+    # read_only: true
+    # tmpfs:
+    #   - /tmp
     # Optional: attach for /help commands. High-FPS y/n is skipped automatically in Docker.
     stdin_open: true
     tty: true

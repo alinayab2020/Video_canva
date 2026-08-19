@@ -1271,6 +1271,7 @@ HELP_TEXT = "\033[1;37m" + """
 ║                                                   ║
 ║  \033[33m─── Server ───\033[1;37m                                  ║
 ║  \033[32m--port\033[1;37m  \033[35mN\033[1;37m      Server port    (default: 8000)    ║
+║  \033[32m--max-clients\033[1;37m \033[35mN\033[1;37m Simultaneous stream cap (def. 32)║
 ║  \033[32m--debug\033[1;37m        Show bandwidth stats (RAW/WIRE)  ║
 ║                                                   ║
 ╚═══════════════════════════════════════════════════╝
