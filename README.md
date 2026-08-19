@@ -32,6 +32,7 @@
 - [Technical Features](#technical-features)
 - [Architecture](#architecture)
 - [Adaptive Frame Codec (opt-in, ASCII modes 2-6)](#adaptive-frame-codec-opt-in-ascii-modes-2-6)
+- [Forensic Watermarking](#forensic-watermarking-screen-capture-proof-leak-tracing)
 - [Zero-Dependency Static Web Player](#zero-dependency-static-web-player)
 - [Installation](#installation)
 - [Running with Docker](#running-with-docker)
@@ -61,6 +62,8 @@
 - **Low-overhead binary protocol**: frames are streamed as raw `Uint8Array` straight to the canvas.
 - **Multiple color modes**: from black & white up to 16M-color high fidelity.
 - **Flexible video management**: JSON playlists (per-video mode & volume), folder-based auto-queuing, single-file mode, infinite loop — all via CLI flags.
+- **Hardened by default**: strict Content-Security-Policy and full security headers, WebSocket origin checks with max-client admission control, flood/fork-bomb protection on the ffmpeg-spawning endpoints, and malformed-command-proof stream loops. See [Security & Hardening](#security--hardening).
+- **Optional forensic watermarking**: invisibly embed a keyed 10-digit ID that survives screen recording/screenshots for leak tracing. See [Forensic Watermarking](#forensic-watermarking-screen-capture-proof-leak-tracing).
 
 ## Architecture
 
@@ -145,6 +148,46 @@ An optional `--quality {lossless,high,balanced,low}` enables lossy *temporal del
 ```bash
 python stream_server.py video.mp4 --host 0.0.0.0
 ```
+
+**Client cap:** every connected browser decodes its own copy of the video, so the
+server admits at most `--max-clients` simultaneous stream clients (default 32).
+Beyond the cap, new connections are politely refused with close code `1013`.
+```bash
+python stream_server.py video.mp4 --host 0.0.0.0 --max-clients 8
+```
+
+## Forensic Watermarking (screen-capture-proof leak tracing)
+
+ASCILINE can invisibly burn a **10-digit viewer ID** into every stream or
+compiled `.ascf`, engineered to survive the analog hole: screenshots,
+screen recordings (H.264/JPEG re-encodes), zoomed windows, brightness
+ramps and border crops — and to remain **mathematically undetectable
+without the secret key**.
+
+```bash
+# embed (key via env to keep it out of the process list)
+export ASCILINE_WM_KEY="long-random-secret"
+./ascil video.mp4 --watermark 8081828384
+
+# detect from a captured clip / screenshot
+python tools/watermark_detect.py pirate_capture.mp4 \
+    --rows 40 --cols 120 --sync
+# → [DETECTED] digits=8081828384  z=66.7σ  bit_errors=0.000 ...
+```
+
+Under the hood: keyed CDMA spread-spectrum chips (HMAC-SHA256 keystream)
+modulate cell-colour luminance by ±8 with a perceptual flicker gate
+(video PSNR 38 dB / SSIM 0.9964 vs unmarked; flat scenes stay
+pixel-frozen), temporal frame-block alternation (frame-differencing
+*cancels content, doubles the mark*), and a hardened payload
+(CRC-16 gate + RS(15,7) soft-erasure ECC). A blind geometry-reSync scan
+recovers cropped/zoomed/surrounded captures.
+
+**Measured:** 18/18 capture attacks recovered bit-exact (CRF 35 screen
+recordings, JPEG q50, 8 % crops, phone-upload chains), **0 wrong-key
+detections**; imperceptibility and geometric limits are published with
+the full method in [docs/WATERMARK.md](docs/WATERMARK.md), and the whole
+battery reproduces with `python experiments/wm_screen_capture.py`.
 
 ## Zero-Dependency Static Web Player
 
@@ -305,9 +348,22 @@ python ascii_video_player2.py --webcam --cols 100
 
 > Don't resize the terminal window during playback — dynamic text wrapping will corrupt the layout.
 
+## Security & Hardening
+
+ASCILINE ships its defenses enabled by default — no configuration required:
+
+- **HTTP**: strict CSP (`default-src 'self'`, no inline scripts), `nosniff`, frame-busting, `no-referrer`, locked-down permissions policy, COOP/CORP isolation, `no-store` on session endpoints and bounded caching for static assets.
+- **WebSocket**: origin allowlist (cross-site hijacking rejected with `1008`), client admission control (`--max-clients`, over-cap rejected with `1013`), inbound message size caps (oversized frames dropped with `1009`), dead-peer reaping via ping keepalives, and per-message fault isolation — a garbage frame can never kill the command channel.
+- **Input handling**: every client-supplied number is coerced NaN/Infinity-proof and clamped to valid ranges before it can reach timing math or an ffmpeg command line; seek/reinit commands are rate-limited per connection.
+- **Process safety**: all subprocesses run shell-free argv arrays with hard timeouts; concurrent ffmpeg audio pipelines and thumbnail builds are semaphore-capped (`503` at saturation instead of resource exhaustion).
+- **Container**: the image runs as a dedicated non-root user and compose drops all Linux capabilities with `no-new-privileges`.
+
+Full details (threat model, deployment guidance for exposure beyond a LAN,
+reporting channel) live in [SECURITY.md](SECURITY.md).
+
 ## Running with Docker
 
-ASCILINE ships with a `Dockerfile` and `docker-compose.yml` for running the live streaming server without installing Python, FFmpeg, or any dependency on the host. The image is based on `python:3.11-slim`, installs FFmpeg/FFprobe and CA certificates, and swaps `opencv-python` for `opencv-python-headless` at build time (the container has no display, so this is the lighter drop-in — see [Requirements](#0-requirements)). Note that webcam and terminal-standalone (`ascii_video_player2.py`) modes aren't practical inside a container — Docker is intended for the web streaming server (`stream_server.py`), which by default runs in **folder mode**, watching `videos/`.
+ASCILINE ships with a `Dockerfile` and `docker-compose.yml` for running the live streaming server without installing Python, FFmpeg, or any dependency on the host. The image is based on `python:3.11-slim`, installs FFmpeg/FFprobe and CA certificates, and swaps `opencv-python` for `opencv-python-headless` at build time (the container has no display, so this is the lighter drop-in — see [Requirements](#0-requirements)). Note that webcam and terminal-standalone (`ascii_video_player2.py`) modes aren't practical inside a container — Docker is intended for the web streaming server (`stream_server.py`), which by default runs in **folder mode**, watching `videos/`. The container runs as a dedicated **non-root** user with all capabilities dropped; for YouTube/URL downloads inside the container, make sure the mounted `./videos` folder is writable by that user (plain file playback needs nothing).
 
 ### Docker Compose (recommended)
 

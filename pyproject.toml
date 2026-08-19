@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asciline"
-version = "0.1.0"
+version = "0.3.0"
 description = "A high-performance, cross-platform real-time ASCII video rendering engine."
 requires-python = ">=3.9"
 authors = [
@@ -21,6 +21,13 @@ dependencies = [
 [project.optional-dependencies]
 ytdlp = [
     "yt-dlp>=2026.07.04",
+]
+# Everything needed to run the complete test suite (pytest incl. the
+# TestClient-based transport tests, which need httpx):
+#   pip install -e ".[test]"   (plus ffmpeg on PATH for the video tests)
+test = [
+    "pytest",
+    "httpx",
 ]
 
 [tool.setuptools]

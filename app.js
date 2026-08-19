@@ -62,8 +62,15 @@ let gridCols = 0, gridRows = 0;
 let charWidth = 0, charHeight = 0;
 let xPos = null, yPos = null;
 
-// Pixel Mode (--pixel) — ImageData pixel buffer
+// Pixel Mode (--pixel) — ImageData pixel buffer (+ its 32-bit view for the
+// single-store-per-pixel fast path)
 let dotImageData = null;
+let dotImageData32 = null;
+
+// Canvas color-string cache (shared, bounded; see codec.js render helpers)
+const cssRGB = (typeof AscilineCodec !== 'undefined' && AscilineCodec.makeColorCache)
+    ? AscilineCodec.makeColorCache()
+    : (r, g, b) => `rgb(${r},${g},${b})`;
 
 // Selection Layer optimization
 const textDecoder = new TextDecoder();
@@ -105,6 +112,7 @@ function buildCanvas(cols, rows) {
         canvas.style.display = 'block';
         canvas.style.imageRendering = 'pixelated';
         dotImageData = ctx.createImageData(cols, rows);
+        dotImageData32 = new Uint32Array(dotImageData.data.buffer);
         // Pre-fill alpha channel to 255 (fully opaque)
         const d = dotImageData.data;
         for (let i = 3; i < d.length; i += 4) d[i] = 255;
@@ -115,6 +123,7 @@ function buildCanvas(cols, rows) {
         // ── STANDARD ASCII MODES (1-5) ──
         canvas.style.imageRendering = '';
         dotImageData = null;
+        dotImageData32 = null;
         ctx.font = 'bold 8px Courier New';
         charWidth = ctx.measureText('M').width;
         charHeight = 8;
@@ -456,15 +465,20 @@ function renderFrame(now) {
 
     if (pixelMode) {
         // ── ZERO-COPY PIXEL MODE ──
-        // Server sends raw BGR (3 bytes/pixel). We swap B↔R here.
-        const view = frame; // Already a Uint8Array
-        const data = dotImageData.data;
-        // view: [B,G,R, B,G,R, ...] → data: [R,G,B,A, R,G,B,A, ...]
-        for (let src = 0, dst = 0; src < view.length; src += 3, dst += 4) {
-            data[dst]     = view[src + 2]; // R (from BGR)
-            data[dst + 1] = view[src + 1]; // G
-            data[dst + 2] = view[src];     // B
-            // Alpha already set to 255 in buildCanvas
+        // Server sends raw BGR (3 bytes/pixel). The shared packer swaps B↔R
+        // into canvas RGBA — one 32-bit store per pixel on little-endian
+        // hosts instead of three 8-bit stores.
+        if (typeof AscilineCodec !== 'undefined' && AscilineCodec.packBGRtoRGBA32) {
+            AscilineCodec.packBGRtoRGBA32(frame, dotImageData32);
+        } else {
+            const view = frame; // Already a Uint8Array
+            const data = dotImageData.data;
+            for (let src = 0, dst = 0; src < view.length; src += 3, dst += 4) {
+                data[dst]     = view[src + 2]; // R (from BGR)
+                data[dst + 1] = view[src + 1]; // G
+                data[dst + 2] = view[src];     // B
+                // Alpha already set to 255 in buildCanvas
+            }
         }
         ctx.putImageData(dotImageData, 0, 0);
     } else if (renderMode === 1) {
@@ -485,7 +499,8 @@ function renderFrame(now) {
         for (let idx = 0; idx < view.length; idx += 4) {
             const packed = (view[idx+1] << 16) | (view[idx+2] << 8) | view[idx+3];
             if (packed !== prevPacked) {
-                ctx.fillStyle = `rgb(${view[idx+1]},${view[idx+2]},${view[idx+3]})`;
+                // cached color string: no per-change allocation
+                ctx.fillStyle = cssRGB(view[idx+1], view[idx+2], view[idx+3]);
                 prevPacked = packed;
             }
             ctx.fillText(CHAR_LUT[view[idx]], xPos[col], yPos[row]);

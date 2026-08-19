@@ -102,6 +102,13 @@ class VideoDecoder:
 # ─────────────────────────────────────────────
 #  MODULE 2 ─ AsciiMapper
 # ─────────────────────────────────────────────
+
+# Color quantization bit-shift per render mode (2=64c .. 6=16M). Single source
+# of truth shared by the live server, the static compiler and the test-vector
+# generator so all three pipelines quantize identically.
+MODE_QUANTIZE_BITS = {6: 0, 5: 2, 4: 3, 3: 5, 2: 6}
+
+
 class AsciiMapper:
     """
     Converts Gray + BGR matrix into a string of ASCII characters
@@ -142,6 +149,23 @@ class AsciiMapper:
         self._n   = len(p)
         self._lut = np.array(p, dtype='U1')
         self._qb  = quantize_bits           # quantization bit shift amount
+        self._index_lut = None              # lazily-built gray->index cache
+
+    def index_lut(self) -> np.ndarray:
+        """
+        256-entry uint8 LUT mapping a gray value directly to a palette index.
+
+        Precomputes `(v * (n - 1)) // 255` for every possible input byte so the
+        per-frame hot path is a single table lookup instead of a widen,
+        multiply, divide and clip pass over every cell. The LUT's maximum value
+        is exactly n - 1, so downstream clipping is provably unnecessary.
+        """
+        lut = self._index_lut
+        if lut is None:
+            lut = ((np.arange(256, dtype=np.uint16) * (self._n - 1))
+                   // 255).astype(np.uint8)
+            self._index_lut = lut
+        return lut
 
     def convert(self, gray: np.ndarray, bgr: np.ndarray) -> str:
         """

@@ -7,8 +7,9 @@ import numpy as np
 import sys
 
 # Import the existing engine components (now in the same directory)
-from ascii_video_player2 import VideoDecoder, AsciiMapper
+from ascii_video_player2 import VideoDecoder, AsciiMapper, MODE_QUANTIZE_BITS
 from codec import encode_frame, DEFAULT_LEVEL, ProfileEncoder
+from watermark import Watermarker, encode_payload as _wm_encode_payload
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
 
 def extract_audio(video_path: str, output_path: str):
@@ -119,7 +120,41 @@ def compile_video(args):
         print(f"[Compiler] Lossy DCT profile (tag 4) ON | QF={args.qf} | grid padded to {cols}x{rows}")
 
     char_byte_lut = np.array([ord(c) for c in mapper._lut], dtype=np.uint8)
-    qb = {6: 0, 5: 2, 4: 3, 3: 5, 2: 6}.get(render_mode, 0)
+    # Same proportional gray->index mapping the live server uses, via LUT.
+    gray_index_lut = mapper.index_lut()
+    qb = MODE_QUANTIZE_BITS.get(render_mode, 0)
+    qb_mask = np.uint8((0xFF << qb) & 0xFF) if qb else None
+
+    # ── FORENSIC WATERMARK ──────────────────────────────────────────
+    # Invisible keyed 10-digit mark, identical embedding math to the live
+    # server (watermark.py). Pixel mode + ASCII colour modes: ±beta luma
+    # dither on cell colours; monochrome ASCII: ±1 density-rank dither.
+    watermarker = None
+    if getattr(args, "watermark", None):
+        if args.profile:
+            print("Error: --watermark cannot be combined with --profile "
+                  "(the lossy DCT quantizer destroys the luma dither). "
+                  "Compile with plain --pixel or an ASCII mode.")
+            decoder.release()
+            return
+        wm_key = (getattr(args, "watermark_key", None)
+                  or os.environ.get("ASCILINE_WM_KEY"))
+        if not wm_key:
+            print("Error: --watermark requires --watermark-key "
+                  "or env ASCILINE_WM_KEY")
+            decoder.release()
+            return
+        try:
+            watermarker = Watermarker(args.watermark, wm_key, rows, cols,
+                                      block=getattr(args, "watermark_block", 1),
+                                      beta=getattr(args, "watermark_beta", 8))
+        except ValueError as e:
+            print(f"Error: --watermark: {e}")
+            decoder.release()
+            return
+        print(f"[Watermark] 10-digit forensic mark ON "
+              f"(block={getattr(args, 'watermark_block', 1)}, "
+              f"beta={max(1, min(64, getattr(args, 'watermark_beta', 8)))})")
     
     frame_buf = np.empty((rows, cols, 4), dtype=np.uint8) if render_mode > 1 else None
 
@@ -153,7 +188,10 @@ def compile_video(args):
                 if pixel_mode:
                     frame_px = np.ascontiguousarray(bgr_frame)
                     if pixel_qb > 0:
-                        frame_px = (frame_px >> pixel_qb) << pixel_qb
+                        # in-place bit-drop mask == (x >> qb) << qb, one pass
+                        frame_px &= np.uint8((0xFF << pixel_qb) & 0xFF)
+                    if watermarker is not None:
+                        watermarker.embed_pixels(frame_px, frame_index)
                     if profile_enc is not None:
                         msg, prev_frame = profile_enc.encode(frame_px)
                     else:
@@ -162,22 +200,33 @@ def compile_video(args):
                             prev_frame, frame_index, level=level, tolerance=tolerance
                         )
                 else:
-                    indices = np.floor_divide(gray_frame, max(1, 256 // mapper._n))
-                    np.clip(indices, 0, mapper._n - 1, out=indices)
-                    
+                    # LUT lookup — identical mapping to the live server path.
+                    indices = gray_index_lut[gray_frame]
+                    if watermarker is not None and render_mode == 1:
+                        # Monochrome text: ±1 glyph density-rank dither (the
+                        # only carrier without colours).
+                        watermarker.embed_indices(indices, frame_index,
+                                                  mapper._n, gray_frame)
+
                     if render_mode == 1:
                         char_matrix = mapper._lut[indices]
                         lines = [''.join(r) for r in char_matrix]
                         payload = (f"{frame_index}\n" + '\n'.join(lines)).encode('utf-8')
                         msg = payload # For mode 1, we just pack the string as bytes
                     else:
-                        char_codes = char_byte_lut[indices]
-                        rgb = bgr_frame[:, :, ::-1]
-                        if qb > 0:
-                            rgb = (rgb >> qb) << qb
-                        frame_buf[:, :, 0] = char_codes
-                        frame_buf[:, :, 1:] = rgb
-                        
+                        frame_buf[:, :, 0] = char_byte_lut[indices]
+                        if qb_mask is not None:
+                            np.bitwise_and(bgr_frame[:, :, ::-1], qb_mask,
+                                           out=frame_buf[:, :, 1:])
+                        else:
+                            frame_buf[:, :, 1:] = bgr_frame[:, :, ::-1]
+
+                        # ±beta luminance dither on the cell colour (same as
+                        # the live server path; glyphs untouched).
+                        if watermarker is not None:
+                            watermarker.embed_pixels(frame_buf[:, :, 1:],
+                                                     frame_index, gray_frame)
+
                         msg, prev_frame = encode_frame(
                             frame_buf, prev_frame, frame_index, level=level, tolerance=tolerance
                         )
@@ -245,7 +294,19 @@ if __name__ == "__main__":
     opt.add_argument("--qf", type=int, default=70, help="Profile quality factor 1-100 (Default 70)")
     opt.add_argument("--hard", action="store_true", help="Use maximum zlib compression (level 9). Slower but smaller file.")
     opt.add_argument("--out", type=str, default="", help="Output base name")
-    
+
+    # ── Forensic watermark ──
+    forensic = parser.add_argument_group('\033[33mForensic Watermark\033[0m')
+    forensic.add_argument("--watermark", metavar="10-DIGITS", default=None,
+        help="Invisibly burn this 10-digit ID into the compiled frames "
+             "(screen-capture-proof forensic mark)")
+    forensic.add_argument("--watermark-key", default=None,
+        help="Secret key for the mark (or env ASCILINE_WM_KEY)")
+    forensic.add_argument("--watermark-block", type=int, default=1, metavar="N",
+        help="Frames per alternation clock (default 1)")
+    forensic.add_argument("--watermark-beta", type=int, default=8, metavar="1-64",
+        help="Pixel-mode luma dither amplitude (default 8)")
+
     args = parser.parse_args()
     
     # Automatically enable pixel mode and color mode 6 if profile is requested
