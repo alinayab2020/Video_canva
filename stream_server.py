@@ -157,11 +157,100 @@ async def lifespan(app: FastAPI):
         loop.default_exception_handler(context)
     loop.set_exception_handler(handle_exception)
 
+    # Concurrency gates (created here so they belong to the serving loop).
+    # Each /audio request spawns a full ffmpeg pipeline: uncapped, a burst of
+    # tab opens or scripted requests would fork-bomb the host. Scrub-sprite
+    # builds each decode an entire video through ffmpeg; cap them too.
+    app.state.audio_semaphore = asyncio.Semaphore(8)
+    app.state.scrub_semaphore = asyncio.Semaphore(2)
+
     task = asyncio.create_task(prefetch_worker())
     yield
     task.cancel()
 
 app = FastAPI(lifespan=lifespan)
+
+# ── SECURITY HEADERS ─────────────────────────────────────────────────────
+# The UI is same-origin only (no CDNs except Google Fonts, no inline scripts),
+# so we can ship a strict CSP. These headers cost nothing and neutralize whole
+# vulnerability classes (XSS, clickjacking, MIME sniffing, cross-origin leaks).
+_CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' https://fonts.googleapis.com; "
+    "font-src https://fonts.gstatic.com; "
+    "img-src 'self' data:; "
+    "media-src 'self'; "
+    "connect-src 'self' ws: wss:; "
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "form-action 'none'; "
+    "frame-ancestors 'none'"
+)
+
+_NO_STORE_PATHS = frozenset(("/", "/audio", "/scrub", "/scrub_sprite"))
+
+
+@app.middleware("http")
+async def security_headers(request, call_next):
+    """Uniform hardening headers on every HTTP response (WS upgrade exempt)."""
+    response = await call_next(request)
+    h = response.headers
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("Referrer-Policy", "no-referrer")
+    h.setdefault("Permissions-Policy",
+                 "accelerometer=(), camera=(), geolocation=(), gyroscope=(), "
+                 "magnetometer=(), microphone=(), payment=(), usb=()")
+    h.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    h.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    path = request.url.path
+    if path == "/":
+        h.setdefault("Content-Security-Policy", _CONTENT_SECURITY_POLICY)
+    if path in _NO_STORE_PATHS:
+        # Dynamic / per-session content must never be shared-cached.
+        h.setdefault("Cache-Control", "no-store")
+    elif path.startswith("/static/"):
+        # Fingerprint-free assets: short-lived cache keeps reloads snappy while
+        # bounding staleness across upgrades.
+        h.setdefault("Cache-Control", "public, max-age=300")
+    return response
+
+
+def _coerce_finite_float(value, default: float) -> float:
+    """float(value) that can never return NaN/inf or raise (client-proof).
+
+    Python's json.loads accepts NaN/Infinity literals, so query/WS clients can
+    smuggle non-finite floats past FastAPI's numeric types; they would poison
+    LUTs and timing math downstream. Anything suspicious falls back to
+    `default`.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
+
+
+def _coerce_int(value, default: int) -> int:
+    """int(value) that never raises and rejects bools/non-integral floats."""
+    if isinstance(value, bool):
+        return default
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    return int(f) if math.isfinite(f) else default
+
+
+def _clamp_seek_time(value, duration: float) -> float:
+    """Sanitize a client-supplied timestamp to a finite time inside the video."""
+    t = _coerce_finite_float(value, 0.0)
+    if t < 0.0:
+        t = 0.0
+    if duration > 0:
+        t = min(t, duration)
+    return t
 
 
 def get_video_dimensions(path: str) -> tuple[int, int]:
@@ -387,17 +476,30 @@ async def audio_stream(v: int | None = None, start: float = 0.0):
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Video file not downloaded or found")
 
+    # `start` arrives from the network: force finite, non-negative and bounded
+    # (a NaN/negative/huge -ss value would otherwise reach the ffmpeg cmdline).
+    start = _coerce_finite_float(start, 0.0)
+    start = min(max(start, 0.0), 86400.0)  # ≤ 24h sanity bound
+
+    # Fast-fail when the ffmpeg pool is saturated instead of queueing a fork.
+    audio_gate = getattr(app.state, "audio_semaphore", None)
+    if audio_gate is not None and audio_gate.locked():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=503, detail="Audio streamer at capacity; retry shortly")
+
     # Map 1-5 → 1.0x-2.0x FFmpeg volume
     ffmpeg_vol = 1.0 + (vol_level - 1) * 0.25
 
     async def audio_generator():
+        if audio_gate is not None:
+            await audio_gate.acquire()
         ffmpeg_cmd = [
             "ffmpeg",
             "-nostdin"
         ]
         if start > 0:
             ffmpeg_cmd.extend(["-ss", str(start)])
-        
+
         ffmpeg_cmd.extend([
             "-i", video_path,
             "-vn",
@@ -409,7 +511,7 @@ async def audio_stream(v: int | None = None, start: float = 0.0):
             "-loglevel", "quiet",
             "pipe:1"
         ])
-        
+
         process = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -417,13 +519,17 @@ async def audio_stream(v: int | None = None, start: float = 0.0):
         )
         try:
             while True:
-                chunk = await process.stdout.read(4096)
+                # 64 KiB reads: 16x fewer event-loop hops than 4 KiB chunks,
+                # still small enough to keep time-to-first-byte instant.
+                chunk = await process.stdout.read(65536)
                 if not chunk:
                     break
                 yield chunk
         except asyncio.CancelledError:
             pass
         finally:
+            if audio_gate is not None:
+                audio_gate.release()
             try:
                 process.terminate()
                 await asyncio.wait_for(process.wait(), timeout=1.0)
@@ -500,6 +606,41 @@ def _scrub_video_path(v: int | None) -> str:
     return entry.get("video", "")
 
 
+# In-flight sprite builds, deduplicated by path: N clients hovering the same
+# video share ONE ffmpeg pass instead of racing N of them.
+_scrub_pending: dict = {}
+
+
+async def _get_scrub_sprite(video_path: str):
+    """Cache-fronted, deduplicated, concurrency-capped sprite builder."""
+    if video_path in _scrub_cache:
+        return _scrub_cache[video_path]
+
+    task = _scrub_pending.get(video_path)
+    if task is None:
+        gate = getattr(app.state, "scrub_semaphore", None)
+
+        async def build():
+            loop = asyncio.get_running_loop()
+            try:
+                if gate is not None:
+                    async with gate:
+                        return await loop.run_in_executor(None, _build_scrub_sprite, video_path)
+                return await loop.run_in_executor(None, _build_scrub_sprite, video_path)
+            except Exception:
+                return None  # sprite failure must never break the endpoint
+
+        task = asyncio.ensure_future(build())
+        _scrub_pending[video_path] = task
+
+    try:
+        result = await task
+    finally:
+        _scrub_pending.pop(video_path, None)
+    _scrub_cache[video_path] = result
+    return result
+
+
 @app.get("/scrub")
 async def scrub_meta(v: int | None = None):
     """Layout for the hover thumbnails. Builds the sprite lazily (off the event
@@ -512,15 +653,12 @@ async def scrub_meta(v: int | None = None):
     video_path = _scrub_video_path(v)
     if not video_path:
         return Response(content='{"available": false}', media_type="application/json")
-        
+
     # If it's a URL, it hasn't been downloaded yet by the playback loop.
     if ytdl.is_url(video_path) or not os.path.exists(video_path):
         return Response(content='{"available": false}', media_type="application/json")
-        
-    if video_path not in _scrub_cache:
-        loop = asyncio.get_event_loop()
-        _scrub_cache[video_path] = await loop.run_in_executor(None, _build_scrub_sprite, video_path)
-    built = _scrub_cache.get(video_path)
+
+    built = await _get_scrub_sprite(video_path)
     if not built:
         return Response(content='{"available": false}', media_type="application/json")
     meta = dict(built["meta"])
@@ -556,17 +694,39 @@ def _origin_allowed(origin: str | None, host_header: str | None = None) -> bool:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    Streams ASCII frames for every video in the queue.
-    Advances to the next entry automatically when a video ends.
-    Loops back to the start if --loop is set.
-    """
+    """Hardened entry: origin policy + admission control, then the stream."""
     # ── Origin Check (prevents cross-site WebSocket hijacking) ──
     origin = websocket.headers.get("origin")
     if not _origin_allowed(origin, websocket.headers.get("host")):
         await websocket.close(code=1008)
         return
 
+    # ── Admission control ──
+    # Every connected client decodes its own copy of the video (OpenCV +
+    # encoder + encoder state), so unbounded connections are a memory/CPU
+    # exhaustion vector. Over the limit: accept then close 1013 (Try Again
+    # Later) so well-behaved clients see a clean, retriable signal.
+    active = getattr(app.state, "active_clients", 0)
+    max_clients = getattr(app.state, "max_clients", 32)
+    if active >= max_clients:
+        await websocket.accept()
+        await websocket.close(code=1013)
+        print(f"[LIMIT] {max_clients} client cap reached — connection rejected (1013)")
+        return
+
+    app.state.active_clients = active + 1
+    try:
+        await _stream_to_client(websocket)
+    finally:
+        app.state.active_clients = max(0, getattr(app.state, "active_clients", 1) - 1)
+
+
+async def _stream_to_client(websocket: WebSocket):
+    """
+    Streams ASCII frames for every video in the queue.
+    Advances to the next entry automatically when a video ends.
+    Loops back to the start if --loop is set.
+    """
     await websocket.accept()
 
     # Opt-in adaptive codec (raw/zlib/delta). Legacy clients omit it and get
@@ -723,14 +883,38 @@ async def websocket_endpoint(websocket: WebSocket):
             is_paused = False
 
             async def receive_commands():
-                try:
-                    while True:
+                # Per-message isolation: a malformed JSON frame must NOT kill
+                # the command pump for the rest of the session (the old code
+                # died silently on the first bad frame).
+                while True:
+                    try:
                         msg = await websocket.receive_json()
+                    except (WebSocketDisconnect, RuntimeError):
+                        return  # connection gone / shutting down
+                    except Exception:
+                        continue  # bad JSON frame: drop it, keep pumping
+                    if isinstance(msg, dict):
                         await cmd_queue.put(msg)
-                except Exception:
-                    pass
-            
+
             receive_task = asyncio.create_task(receive_commands())
+
+            # ── Command rate limiting (token bucket) ──
+            # Seek/reinit are expensive (OpenCV container seek + decoder resync
+            # + client audio restart). 8-op burst, refilled at 2 ops/sec — far
+            # above any human usage, far below fork-bomb territory.
+            _CMD_BURST, _CMD_REFILL = 8.0, 2.0
+            cmd_budget = _CMD_BURST
+            cmd_last_refill = time.monotonic()
+
+            def _cmd_throttled() -> bool:
+                nonlocal cmd_budget, cmd_last_refill
+                now = time.monotonic()
+                cmd_budget = min(_CMD_BURST, cmd_budget + (now - cmd_last_refill) * _CMD_REFILL)
+                cmd_last_refill = now
+                if cmd_budget < 1.0:
+                    return True
+                cmd_budget -= 1.0
+                return False
 
             raw_frame_num = 0
 
@@ -838,7 +1022,10 @@ async def websocket_endpoint(websocket: WebSocket):
                                 start_time = _loop.time() - (frame_index * frame_t)
                                 bw_start_time = time.time()
                         elif msg.get("type") == "seek":
-                            target_sec = float(msg.get("time", 0))
+                            if _cmd_throttled():
+                                continue  # drop flood excess; client stays synced via clock
+                            duration_s = decoder.frame_count / decoder.fps if decoder.fps > 0 else 0
+                            target_sec = _clamp_seek_time(msg.get("time", 0), duration_s)
                             await _loop.run_in_executor(None, decoder.seek, target_sec)
                             prev_frame = None
                             frame_index = int(target_sec * effective_fps)
@@ -859,6 +1046,8 @@ async def websocket_endpoint(websocket: WebSocket):
                                 client_backlog = 0
                                 consec_high_reports = 0
                         elif msg.get("type") == "reinit":
+                            if _cmd_throttled():
+                                continue
                             # Soft reload: Toggle pixel mode and send new INIT
                             pixel_mode = bool(msg.get("pixel", pixel_mode))
                             
@@ -879,7 +1068,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 pixel_send_buf = bytearray(4 + rows * cols * 3)
                             
                             duration = decoder.frame_count / decoder.fps if decoder.fps > 0 else 0
-                            target_sec = float(msg.get("time", 0))
+                            target_sec = _clamp_seek_time(msg.get("time", 0), duration)
                             await websocket.send_text(f"INIT:{effective_fps}:{render_mode}:{cols}:{rows}:{int(pixel_mode)}:{queue_index}:{duration:.3f}:{target_sec}:{int(is_webcam)}")
                             
                             await _loop.run_in_executor(None, decoder.seek, target_sec)
@@ -892,13 +1081,17 @@ async def websocket_endpoint(websocket: WebSocket):
                             consec_drops = 0
                         elif msg.get("type") == "filter":
                             # ── RUNTIME FILTER UPDATE ──
-                            # Rebuild the mapper / LUT only when values actually change.
-                            new_contrast   = float(msg.get("contrast",   filter_contrast))
-                            new_gamma      = float(msg.get("gamma",      filter_gamma))
-                            new_brightness = float(msg.get("brightness", filter_brightness))
-                            new_invert     = bool(msg.get("invert",      filter_invert))
-                            new_sharpness  = int(msg.get("sharpness",    filter_sharpness))
-                            new_palette    = str(msg.get("palette",      filter_palette))
+                            # Every field is coerced defensively: any junk
+                            # (wrong type, NaN, inf) falls back to the current
+                            # value instead of poisoning LUTs or raising.
+                            new_contrast   = _coerce_finite_float(msg.get("contrast",   filter_contrast),   filter_contrast)
+                            new_gamma      = _coerce_finite_float(msg.get("gamma",      filter_gamma),      filter_gamma)
+                            new_brightness = _coerce_finite_float(msg.get("brightness", filter_brightness), filter_brightness)
+                            _inv_raw       = msg.get("invert", filter_invert)
+                            new_invert     = _inv_raw if isinstance(_inv_raw, bool) else filter_invert
+                            new_sharpness  = _coerce_int(msg.get("sharpness", filter_sharpness), filter_sharpness)
+                            _pal_raw       = msg.get("palette", filter_palette)
+                            new_palette    = _pal_raw if isinstance(_pal_raw, str) else filter_palette
 
                             # Clamp to safe ranges
                             new_contrast   = max(0.1, min(3.0, new_contrast))
@@ -1225,6 +1418,12 @@ if __name__ == "__main__":
     srv.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
     srv.add_argument("--debug", action="store_true", default=False, help="Enable bandwidth debug logging (RAW vs WIRE)")
     srv.add_argument("--cache-limit", type=int, default=10240, help="Cache limit in MB for downloaded videos (default: 10240 = 10GB)")
+    srv.add_argument(
+        "--max-clients",
+        type=int, default=32,
+        help="Max simultaneous WebSocket stream clients (each decodes its own copy "
+             "of the video; the cap blocks connection-flood resource exhaustion)"
+    )
 
     args = parser.parse_args()
 
@@ -1253,6 +1452,8 @@ if __name__ == "__main__":
     app.state.debug         = args.debug
     app.state.thumbnails    = not args.no_thumbnails
     app.state.cache_limit   = args.cache_limit * 1024**2
+    app.state.max_clients   = max(1, args.max_clients)
+    app.state.active_clients = 0
     global_default_cols     = args.cols if args.cols is not None else (450 if args.pixel else 200)
     app.state.cols          = global_default_cols
     app.state.rows          = args.rows
@@ -1342,6 +1543,22 @@ if __name__ == "__main__":
             "host": args.host,
             "port": args.port,
             "log_level": "warning",
+            # ── Transport hardening ──
+            # Client->server messages are tiny JSON commands; anything larger
+            # is junk. 1 MiB bound kills memory-flood frames before parse.
+            "ws_max_size": 1 << 20,
+            # Bound the per-connection send buffer so a slow/stalled client
+            # can't wedge frame backlog in server memory.
+            "ws_max_queue": 32,
+            # Detect silently-dead peers and reclaim their client slots.
+            "ws_ping_interval": 20.0,
+            "ws_ping_timeout": 20.0,
+            # Frames are already zlib-compressed by the adaptive codec —
+            # per-message deflate would only waste server CPU at 30 fps.
+            "ws_per_message_deflate": False,
+            "backlog": 256,
+            "limit_concurrency": 512,
+            "timeout_graceful_shutdown": 3,
         },
         daemon=True
     )
