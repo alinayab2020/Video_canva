@@ -105,13 +105,13 @@ _download_locks = {}
 async def safe_resolve_video_path(vid: str):
     """Safely downloads a video without blocking the event loop and prevents concurrent downloads of the same video."""
     if not ytdl.is_url(vid):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, resolve_video_path, vid)
         
     if vid not in _download_locks:
         _download_locks[vid] = asyncio.Lock()
     async with _download_locks[vid]:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, resolve_video_path, vid)
 
 async def prefetch_worker():
@@ -869,7 +869,7 @@ async def _stream_to_client(websocket: WebSocket):
 
             import struct
             import time
-            start_time = asyncio.get_event_loop().time()
+            start_time = asyncio.get_running_loop().time()
             bw_start_time = time.time()
             bw_bytes_sent = 0
             bw_raw_bytes = 0
@@ -1016,7 +1016,7 @@ async def _stream_to_client(websocket: WebSocket):
             consec_high_reports = 0 # hysteresis: consecutive reports exceeding BACKLOG_HIGH
             consec_drops = 0
 
-            _loop = asyncio.get_event_loop()
+            _loop = asyncio.get_running_loop()
 
             try:
                 while True:
