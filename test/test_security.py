@@ -133,6 +133,12 @@ class HttpSecurityTests(unittest.TestCase):
         finally:
             ss.app.state.audio_semaphore = saved
 
+    def test_healthz(self):
+        r = self.client.get("/healthz")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), {"status": "ok"})
+        self.assertEqual(r.headers.get("cache-control"), "no-store")
+
     def test_audio_muted_video_is_204(self):
         saved = ss.app.state.queue
         try:

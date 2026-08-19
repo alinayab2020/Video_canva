@@ -23,6 +23,13 @@ services:
     # read_only: true
     # tmpfs:
     #   - /tmp
+    # Liveness probe (uses only the Python stdlib inside the image)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     # Optional: attach for /help commands. High-FPS y/n is skipped automatically in Docker.
     stdin_open: true
     tty: true

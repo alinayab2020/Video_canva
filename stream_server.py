@@ -188,7 +188,7 @@ _CONTENT_SECURITY_POLICY = (
     "frame-ancestors 'none'"
 )
 
-_NO_STORE_PATHS = frozenset(("/", "/audio", "/scrub", "/scrub_sprite"))
+_NO_STORE_PATHS = frozenset(("/", "/audio", "/scrub", "/scrub_sprite", "/healthz"))
 
 
 @app.middleware("http")
@@ -440,6 +440,12 @@ def build_queue(args) -> list[dict]:
 async def root():
     """Serves the Frontend (HTML/JS/CSS) file to the client."""
     return HTMLResponse(get_html_content())
+
+
+@app.get("/healthz")
+async def healthz():
+    """Minimal liveness probe for Docker/k8s health checks (no state leaked)."""
+    return {"status": "ok"}
 
 
 @app.get("/audio")
