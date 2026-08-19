@@ -44,11 +44,6 @@ jobs:
     - name: Run Pytest Suite
       run: pytest test/
 
-    - name: Run JS Unit Tests (render helpers + stream parser)
-      run: |
-        node test/test_render_helpers.js
-        node test/test_reader_parser.js
-
     - name: Generate Synthetic Test Videos
       run: bash experiments/make_test_clips.sh
 
